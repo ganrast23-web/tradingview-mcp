@@ -7,10 +7,14 @@
 //|   1. EA memasang deretan pending order BUY STOP di atas harga    |
 //|      dan SELL STOP di bawah harga, dengan jarak tetap (step).    |
 //|   2. Setiap order punya Take Profit dan Stop Loss sendiri.       |
-//|   3. Selain TP/SL per order, ada Basket Target (total profit     |
-//|      semua posisi) dan Basket Stop Loss / Equity Stop.           |
-//|   4. Saat basket target/SL tercapai -> semua posisi ditutup,     |
-//|      semua pending dihapus, lalu grid dibangun ulang.            |
+//|   3. Tiga lapis pengaman profit:                                 |
+//|      a. Break even   - SL ke titik impas setelah profit tertentu |
+//|      b. Trailing SL  - SL mengikuti harga per posisi             |
+//|      c. Trailing basket - total profit semua posisi di-trail,    |
+//|         ditutup bila mundur dari puncaknya                       |
+//|   4. Proteksi: Basket Stop Loss dan Equity Stop.                 |
+//|   5. Saat siklus ditutup -> semua posisi ditutup, semua pending  |
+//|      dihapus, lalu grid dibangun ulang.                          |
 //|                                                                  |
 //|  Catatan point: XAUUSD 2 desimal -> 1 point = 0.01               |
 //|                 jadi step 30 point = 0.30 harga emas.            |
@@ -57,11 +61,22 @@ input double InpMaxLot              = 1.0;        // Batas lot maksimum per orde
 input int    InpTakeProfitPoints    = 200;        // Take Profit per order (point, 0 = off)
 input int    InpStopLossPoints      = 400;        // Stop Loss per order (point, 0 = off)
 
-//--- Trailing stop ---------------------------------------------------
-input bool   InpUseTrailing         = false;      // Aktifkan trailing stop
+//--- Break even (kunci modal) ----------------------------------------
+input bool   InpUseBreakEven        = true;       // Pindahkan SL ke titik impas
+input int    InpBreakEvenStart      = 100;        // Profit sebelum SL ke BEP (point)
+input int    InpBreakEvenLock       = 20;         // Profit yang dikunci di BEP (point)
+
+//--- Trailing stop per posisi ----------------------------------------
+input bool   InpUseTrailing         = true;       // Aktifkan trailing stop per posisi
 input int    InpTrailStartPoints    = 150;        // Mulai trailing setelah profit (point)
 input int    InpTrailDistPoints     = 100;        // Jarak trailing dari harga (point)
 input int    InpTrailStepPoints     = 20;         // Langkah minimum geser SL (point)
+
+//--- Trailing basket (trailing total profit semua posisi) ------------
+input bool   InpUseBasketTrailing   = true;       // Aktifkan trailing profit basket
+input double InpBasketTrailStart    = 10.0;       // Mulai trailing basket di profit ini
+input double InpBasketTrailStop     = 4.0;        // Tutup bila mundur sekian dari puncak
+input double InpBasketTrailStep     = 2.0;        // Kenaikan puncak minimum untuk dicatat
 
 //--- Proteksi basket -------------------------------------------------
 input bool   InpUseBasketTP         = true;       // Tutup semua saat target profit
@@ -98,6 +113,8 @@ datetime g_lastTick   = 0;          // throttle: proses berat 1x per detik
 int      g_cycles     = 0;          // jumlah siklus grid selesai
 double   g_realized   = 0.0;        // akumulasi profit siklus yang ditutup EA
 bool     g_gridBuilt  = false;      // grid pernah dibangun pada sesi ini
+bool     g_trailArmed = false;      // trailing basket sudah aktif
+double   g_basketPeak = 0.0;        // puncak profit basket pada siklus berjalan
 
 //+------------------------------------------------------------------+
 //| Helper: hitung jumlah desimal dari volume step                   |
@@ -293,10 +310,12 @@ void CloseCycle(const string reason, const double basket)
    CloseAllPositions();
    DeleteAllPendings();
 
-   g_realized  += basket;
+   g_realized   += basket;
    g_cycles++;
-   g_gridBuilt = false;
-   g_nextBuild = TimeCurrent() + InpRebuildDelaySec;
+   g_gridBuilt   = false;
+   g_trailArmed  = false;
+   g_basketPeak  = 0.0;
+   g_nextBuild   = TimeCurrent() + InpRebuildDelaySec;
   }
 
 //+------------------------------------------------------------------+
@@ -361,16 +380,28 @@ void BuildGrid()
   }
 
 //+------------------------------------------------------------------+
-//| Trailing stop untuk posisi yang sudah profit                     |
+//| Break even + trailing stop per posisi                            |
+//|                                                                  |
+//|  Dijalankan berurutan pada tiap posisi:                          |
+//|   1. Break even : profit >= InpBreakEvenStart  -> SL ke harga    |
+//|                   buka + InpBreakEvenLock (modal terkunci).      |
+//|   2. Trailing   : profit >= InpTrailStartPoints -> SL mengikuti  |
+//|                   harga sejauh InpTrailDistPoints, hanya digeser |
+//|                   bila membaik minimal InpTrailStepPoints.       |
+//|  SL tidak pernah digeser ke arah yang merugikan.                 |
 //+------------------------------------------------------------------+
-void ManageTrailing()
+void ManageStops()
   {
-   if(!InpUseTrailing || InpTrailDistPoints <= 0)
+   if(!InpUseBreakEven && !InpUseTrailing)
       return;
 
    double ask     = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid     = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   int    minDist = MinStopDistance();
+   if(ask <= 0.0 || bid <= 0.0)
+      return;
+
+   double minGap  = MinStopDistance() * g_point;
+   double halfPt  = g_point * 0.5;
 
    for(int i = PositionsTotal() - 1; i >= 0; i--)
      {
@@ -382,47 +413,125 @@ void ManageTrailing()
       if((long)PositionGetInteger(POSITION_MAGIC) != InpMagic)
          continue;
 
-      long   type    = PositionGetInteger(POSITION_TYPE);
-      double open    = PositionGetDouble(POSITION_PRICE_OPEN);
-      double curSL   = PositionGetDouble(POSITION_SL);
-      double curTP   = PositionGetDouble(POSITION_TP);
+      long   type  = PositionGetInteger(POSITION_TYPE);
+      double open  = PositionGetDouble(POSITION_PRICE_OPEN);
+      double curSL = PositionGetDouble(POSITION_SL);
+      double curTP = PositionGetDouble(POSITION_TP);
+      double newSL = curSL;
 
       if(type == POSITION_TYPE_BUY)
         {
          double gain = (bid - open) / g_point;
-         if(gain < InpTrailStartPoints)
-            continue;
 
-         double newSL = NormalizeDouble(bid - InpTrailDistPoints * g_point, g_digits);
-         if(newSL >= bid - minDist * g_point)
-            continue;
-         if(curSL > 0.0 && newSL - curSL < InpTrailStepPoints * g_point)
-            continue;
-         if(newSL <= curSL)
-            continue;
+         //--- 1. break even ---------------------------------------
+         if(InpUseBreakEven && InpBreakEvenStart > 0 && gain >= InpBreakEvenStart)
+           {
+            double be = NormalizeDouble(open + InpBreakEvenLock * g_point, g_digits);
+            if(be > newSL + halfPt && be < bid - minGap)
+               newSL = be;
+           }
 
-         if(!g_trade.PositionModify(ticket, newSL, curTP))
-            PrintFormat("Trailing buy #%I64u gagal: %d", ticket, g_trade.ResultRetcode());
+         //--- 2. trailing -----------------------------------------
+         if(InpUseTrailing && InpTrailDistPoints > 0 && gain >= InpTrailStartPoints)
+           {
+            double tr = NormalizeDouble(bid - InpTrailDistPoints * g_point, g_digits);
+            if(tr > newSL + halfPt && tr < bid - minGap)
+              {
+               // hanya geser bila perbaikannya cukup besar
+               if(curSL <= 0.0 || tr - curSL >= InpTrailStepPoints * g_point)
+                  newSL = tr;
+              }
+           }
+
+         if(newSL > curSL + halfPt)
+           {
+            if(!g_trade.PositionModify(ticket, newSL, curTP))
+               PrintFormat("Modify SL buy #%I64u gagal: %d - %s", ticket,
+                           g_trade.ResultRetcode(), g_trade.ResultRetcodeDescription());
+           }
         }
       else
          if(type == POSITION_TYPE_SELL)
            {
             double gain = (open - ask) / g_point;
-            if(gain < InpTrailStartPoints)
-               continue;
 
-            double newSL = NormalizeDouble(ask + InpTrailDistPoints * g_point, g_digits);
-            if(newSL <= ask + minDist * g_point)
-               continue;
-            if(curSL > 0.0 && curSL - newSL < InpTrailStepPoints * g_point)
-               continue;
-            if(curSL > 0.0 && newSL >= curSL)
-               continue;
+            //--- 1. break even --------------------------------------
+            if(InpUseBreakEven && InpBreakEvenStart > 0 && gain >= InpBreakEvenStart)
+              {
+               double be = NormalizeDouble(open - InpBreakEvenLock * g_point, g_digits);
+               if((newSL <= 0.0 || be < newSL - halfPt) && be > ask + minGap)
+                  newSL = be;
+              }
 
-            if(!g_trade.PositionModify(ticket, newSL, curTP))
-               PrintFormat("Trailing sell #%I64u gagal: %d", ticket, g_trade.ResultRetcode());
+            //--- 2. trailing ----------------------------------------
+            if(InpUseTrailing && InpTrailDistPoints > 0 && gain >= InpTrailStartPoints)
+              {
+               double tr = NormalizeDouble(ask + InpTrailDistPoints * g_point, g_digits);
+               if((newSL <= 0.0 || tr < newSL - halfPt) && tr > ask + minGap)
+                 {
+                  if(curSL <= 0.0 || curSL - tr >= InpTrailStepPoints * g_point)
+                     newSL = tr;
+                 }
+              }
+
+            if(newSL > 0.0 && (curSL <= 0.0 || newSL < curSL - halfPt))
+              {
+               if(!g_trade.PositionModify(ticket, newSL, curTP))
+                  PrintFormat("Modify SL sell #%I64u gagal: %d - %s", ticket,
+                              g_trade.ResultRetcode(), g_trade.ResultRetcodeDescription());
+              }
            }
      }
+  }
+
+//+------------------------------------------------------------------+
+//| Trailing profit basket (total semua posisi)                      |
+//|                                                                  |
+//|  Begitu total profit menyentuh InpBasketTrailStart, EA mencatat  |
+//|  puncak profit. Selama profit naik, posisi dibiarkan berjalan.   |
+//|  Bila profit mundur InpBasketTrailStop dari puncak, semua        |
+//|  ditutup. Ini menggantikan target tetap InpBasketTargetMoney.    |
+//|                                                                  |
+//|  Return: true bila siklus ditutup.                               |
+//+------------------------------------------------------------------+
+bool ManageBasketTrailing(const double basket)
+  {
+   if(!InpUseBasketTrailing || InpBasketTrailStop <= 0.0)
+      return false;
+
+   //--- arming ---------------------------------------------------------
+   if(!g_trailArmed)
+     {
+      if(basket < InpBasketTrailStart)
+         return false;
+
+      g_trailArmed = true;
+      g_basketPeak = basket;
+      PrintFormat("Trailing basket AKTIF di %.2f %s (mundur %.2f = tutup).",
+                  basket, AccountInfoString(ACCOUNT_CURRENCY), InpBasketTrailStop);
+      return false;
+     }
+
+   //--- catat puncak baru ----------------------------------------------
+   if(basket >= g_basketPeak + InpBasketTrailStep)
+     {
+      g_basketPeak = basket;
+      PrintFormat("Puncak basket baru: %.2f %s", g_basketPeak, AccountInfoString(ACCOUNT_CURRENCY));
+     }
+   else
+      if(basket > g_basketPeak)
+         g_basketPeak = basket;      // naik tipis, tetap dicatat tanpa log
+
+   //--- cek retracement -------------------------------------------------
+   if(basket <= g_basketPeak - InpBasketTrailStop)
+     {
+      PrintFormat("Trailing basket kena: puncak %.2f -> sekarang %.2f",
+                  g_basketPeak, basket);
+      CloseCycle("BASKET TRAILING", basket);
+      return true;
+     }
+
+   return false;
   }
 
 //+------------------------------------------------------------------+
@@ -465,21 +574,46 @@ void UpdatePanel(const double basket)
       return;
 
    string cur = AccountInfoString(ACCOUNT_CURRENCY);
+
+   //--- baris status exit basket ---------------------------------------
+   string exitLine;
+   if(InpUseBasketTrailing && InpBasketTrailStop > 0.0)
+     {
+      if(g_trailArmed)
+         exitLine = StringFormat("Trail basket: AKTIF  puncak %.2f  tutup di %.2f",
+                                 g_basketPeak, g_basketPeak - InpBasketTrailStop);
+      else
+         exitLine = StringFormat("Trail basket: menunggu profit %.2f", InpBasketTrailStart);
+     }
+   else
+      exitLine = StringFormat("Target tetap: %.2f %s", InpBasketTargetMoney, cur);
+
+   //--- baris status trailing per posisi -------------------------------
+   string stopLine = StringFormat("BEP %s (%d/%d pt)   Trail %s (%d/%d/%d pt)",
+                                  (InpUseBreakEven ? "ON" : "off"),
+                                  InpBreakEvenStart, InpBreakEvenLock,
+                                  (InpUseTrailing ? "ON" : "off"),
+                                  InpTrailStartPoints, InpTrailDistPoints, InpTrailStepPoints);
+
    string txt = StringFormat(
                    "=== Grid Straddle TP/SL ===\n"
                    "Simbol      : %s   Spread: %d pt\n"
                    "Status      : %s\n"
                    "Posisi      : %d   Pending: %d\n"
-                   "Basket P/L  : %.2f %s  (target %.2f / stop -%.2f)\n"
+                   "Basket P/L  : %.2f %s   (stop -%.2f)\n"
+                   "%s\n"
                    "TP/SL order : %d / %d point\n"
+                   "%s\n"
                    "Grid        : %d level x %d point (offset %d)\n"
                    "Siklus      : %d   Akumulasi: %.2f %s\n"
                    "Balance     : %.2f   Equity: %.2f",
                    _Symbol, CurrentSpread(),
                    (g_halted ? "DIHENTIKAN" : "AKTIF"),
                    CountPositions(), CountPendings(),
-                   basket, cur, InpBasketTargetMoney, InpBasketMaxLossMoney,
+                   basket, cur, InpBasketMaxLossMoney,
+                   exitLine,
                    InpTakeProfitPoints, InpStopLossPoints,
+                   stopLine,
                    InpLevels, InpStepPoints, InpFirstOffsetPoints,
                    g_cycles, g_realized, cur,
                    AccountInfoDouble(ACCOUNT_BALANCE), AccountInfoDouble(ACCOUNT_EQUITY));
@@ -532,6 +666,31 @@ int OnInit()
       PrintFormat("Peringatan: SL %d point <= stop level broker %d point, order bisa ditolak.",
                   InpStopLossPoints, minDist);
 
+   //--- validasi break even / trailing ---------------------------------
+   if(InpUseBreakEven && InpUseTrailing && InpTrailStartPoints < InpBreakEvenStart)
+      Print("Peringatan: InpTrailStartPoints < InpBreakEvenStart, trailing akan jalan sebelum BEP.");
+   if(InpUseTrailing && InpTrailDistPoints <= minDist)
+      PrintFormat("Peringatan: InpTrailDistPoints %d <= stop level broker %d, trailing tidak akan jalan.",
+                  InpTrailDistPoints, minDist);
+   if(InpUseTrailing && InpStopLossPoints > 0 && InpTrailStartPoints <= 0)
+      Print("Peringatan: InpTrailStartPoints 0, SL akan langsung ditarik sejak posisi dibuka.");
+   if(InpUseBreakEven && InpBreakEvenLock >= InpBreakEvenStart)
+      Print("Peringatan: InpBreakEvenLock >= InpBreakEvenStart, SL break even bisa ditolak broker.");
+
+   //--- validasi trailing basket ---------------------------------------
+   if(InpUseBasketTrailing)
+     {
+      if(InpBasketTrailStop <= 0.0)
+        {
+         Print("InpBasketTrailStop harus > 0 bila trailing basket aktif.");
+         return INIT_PARAMETERS_INCORRECT;
+        }
+      if(InpBasketTrailStop >= InpBasketTrailStart)
+         Print("Peringatan: InpBasketTrailStop >= InpBasketTrailStart, siklus bisa ditutup rugi.");
+      if(InpUseBasketTP)
+         PrintFormat("Info: trailing basket aktif, target tetap %.2f diabaikan.", InpBasketTargetMoney);
+     }
+
    if(!AccountInfoInteger(ACCOUNT_TRADE_EXPERT))
       Print("Peringatan: AutoTrading dinonaktifkan di terminal/akun.");
 
@@ -542,9 +701,11 @@ int OnInit()
    g_trade.SetAsyncMode(false);
    g_trade.LogLevel(LOG_LEVEL_ERRORS);
 
-   g_halted    = false;
-   g_gridBuilt = false;
-   g_nextBuild = 0;
+   g_halted     = false;
+   g_gridBuilt  = false;
+   g_trailArmed = false;
+   g_basketPeak = 0.0;
+   g_nextBuild  = 0;
 
    PrintFormat("GridStraddleTPSL siap. %s digits=%d point=%s stopLevel=%d",
                _Symbol, g_digits, DoubleToString(g_point, g_digits), minDist);
@@ -589,11 +750,18 @@ void OnTick()
    //--- 1. proteksi basket ---------------------------------------------
    if(pos > 0)
      {
-      if(InpUseBasketTP && InpBasketTargetMoney > 0.0 && basket >= InpBasketTargetMoney)
+      //--- trailing basket lebih diutamakan daripada target tetap ------
+      if(InpUseBasketTrailing && InpBasketTrailStop > 0.0)
         {
-         CloseCycle("TARGET PROFIT", basket);
-         return;
+         if(ManageBasketTrailing(basket))
+            return;
         }
+      else
+         if(InpUseBasketTP && InpBasketTargetMoney > 0.0 && basket >= InpBasketTargetMoney)
+           {
+            CloseCycle("TARGET PROFIT", basket);
+            return;
+           }
 
       if(InpUseBasketSL && InpBasketMaxLossMoney > 0.0 && basket <= -InpBasketMaxLossMoney)
         {
@@ -629,12 +797,19 @@ void OnTick()
       return;
      }
 
-   //--- 3. trailing stop -------------------------------------------------
-   ManageTrailing();
+   //--- 3. break even + trailing stop per posisi -------------------------
+   ManageStops();
 
    //--- 4. bangun / bangun ulang grid ------------------------------------
    if(pos != 0 || pend != 0)
       return;                          // siklus masih berjalan
+
+   //--- semua posisi habis (mis. kena TP/SL sendiri) -> reset trailing ---
+   if(g_trailArmed)
+     {
+      g_trailArmed = false;
+      g_basketPeak = 0.0;
+     }
 
    if(g_gridBuilt && !InpAutoRebuild)
       return;                          // sekali jalan saja

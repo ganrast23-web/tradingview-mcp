@@ -38,12 +38,72 @@ Nilai default EA ini disetel mengikuti angka tersebut (`InpStepPoints = 30`,
 2. Tiap pending order dipasang lengkap dengan TP (`InpTakeProfitPoints`) dan SL
    (`InpStopLossPoints`) sehingga setiap posisi punya exit sendiri.
 3. Saat harga bergerak, pending order tereksekusi menjadi posisi.
-4. Total floating P/L semua posisi dipantau tiap detik:
-   - `>= InpBasketTargetMoney` → tutup semua posisi + hapus semua pending
+4. Setiap posisi yang berjalan dikelola dua tahap: **break even** lalu **trailing stop**
+   (lihat bagian di bawah).
+5. Total floating P/L semua posisi dipantau tiap detik:
+   - **trailing basket** aktif → ditutup saat profit mundur dari puncaknya
+   - atau, bila trailing basket dimatikan, `>= InpBasketTargetMoney` → tutup semua
    - `<= -InpBasketMaxLossMoney` → tutup semua (proteksi)
    - equity turun `InpEquityStopPercent` % dari balance → tutup semua + hentikan EA
-5. Setelah siklus ditutup, EA menunggu `InpRebuildDelaySec` detik lalu membangun grid baru
+6. Setelah siklus ditutup, EA menunggu `InpRebuildDelaySec` detik lalu membangun grid baru
    di sekitar harga terkini (bila `InpAutoRebuild = true`).
+
+## Trailing stop — tiga lapis
+
+EA punya tiga mekanisme pengunci profit yang bekerja bersamaan di level berbeda.
+
+### 1. Break even (per posisi)
+
+Begitu sebuah posisi untung `InpBreakEvenStart` point, SL dipindah ke harga buka
++ `InpBreakEvenLock` point. Posisi itu tidak bisa rugi lagi.
+
+```
+Buy dibuka 4220.00, BEP start 100 pt, lock 20 pt
+harga naik ke 4221.00 (+100 pt)  ->  SL pindah dari 4216.00 ke 4220.20
+```
+
+### 2. Trailing stop (per posisi)
+
+Setelah profit mencapai `InpTrailStartPoints`, SL mengekor harga sejauh
+`InpTrailDistPoints` dan hanya digeser bila perbaikannya minimal
+`InpTrailStepPoints` (supaya tidak membanjiri server dengan request modify).
+
+```
+Buy 4220.00, trail start 150 pt, jarak 100 pt, step 20 pt
+harga 4221.50 (+150 pt) -> SL 4220.50
+harga 4222.00           -> SL 4221.00
+harga turun ke 4221.00  -> SL tetap 4221.00, posisi tutup untung +100 pt
+```
+
+SL tidak pernah digeser ke arah yang merugikan, dan selalu dicek terhadap
+`SYMBOL_TRADE_STOPS_LEVEL` broker supaya tidak ditolak.
+
+### 3. Trailing basket (total semua posisi)
+
+Ini yang paling cocok untuk grid, karena di grid posisi buy dan sell saling
+mengimbangi — yang penting totalnya, bukan nasib satu posisi.
+
+Begitu total profit menyentuh `InpBasketTrailStart`, EA mencatat puncak profit.
+Selama profit terus naik, semua posisi dibiarkan berjalan. Saat profit mundur
+`InpBasketTrailStop` dari puncak, semuanya ditutup sekaligus.
+
+```
+Trail start 10, trail stop 4
+basket +10.00  -> trailing aktif, puncak 10.00
+basket +18.00  -> puncak 18.00 (tutup bila turun ke 14.00)
+basket +25.00  -> puncak 25.00 (tutup bila turun ke 21.00)
+basket +20.90  -> TUTUP SEMUA di +20.90
+```
+
+Bandingkan dengan target tetap 10 $ di video: siklus itu akan berhenti di +10 $,
+sementara trailing basket membiarkannya lari sampai +20.90 $.
+
+> **Penting:** bila `InpUseBasketTrailing = true`, target tetap
+> `InpBasketTargetMoney` **diabaikan** — kalau tidak, siklus akan selalu ditutup di
+> 10 $ dan trailing tidak pernah sempat jalan. Untuk kembali ke perilaku persis
+> seperti video, set `InpUseBasketTrailing = false`.
+>
+> Basket **stop loss** dan **equity stop** tetap aktif di kedua mode.
 
 ## Parameter
 
@@ -78,13 +138,28 @@ Nilai default EA ini disetel mengikuti angka tersebut (`InpStepPoints = 30`,
 | `InpTakeProfitPoints` | 200 | TP per order dalam point (0 = tanpa TP) |
 | `InpStopLossPoints` | 400 | SL per order dalam point (0 = tanpa SL) |
 
-### Trailing stop
+### Break even (kunci modal)
 | Parameter | Default | Keterangan |
 |---|---|---|
-| `InpUseTrailing` | false | Aktifkan trailing |
+| `InpUseBreakEven` | true | Pindahkan SL ke titik impas |
+| `InpBreakEvenStart` | 100 | Profit minimum sebelum SL digeser ke BEP (point) |
+| `InpBreakEvenLock` | 20 | Profit yang dikunci di atas/bawah harga buka (point) |
+
+### Trailing stop per posisi
+| Parameter | Default | Keterangan |
+|---|---|---|
+| `InpUseTrailing` | true | Aktifkan trailing per posisi |
 | `InpTrailStartPoints` | 150 | Profit minimum sebelum trailing jalan |
-| `InpTrailDistPoints` | 100 | Jarak SL dari harga |
+| `InpTrailDistPoints` | 100 | Jarak SL dari harga berjalan |
 | `InpTrailStepPoints` | 20 | Langkah minimum penggeseran SL |
+
+### Trailing basket (total profit)
+| Parameter | Default | Keterangan |
+|---|---|---|
+| `InpUseBasketTrailing` | true | Trail total profit semua posisi |
+| `InpBasketTrailStart` | 10.0 | Mulai trailing saat total profit mencapai nilai ini |
+| `InpBasketTrailStop` | 4.0 | Tutup semua bila profit mundur sekian dari puncak |
+| `InpBasketTrailStep` | 2.0 | Kenaikan puncak minimum sebelum dicatat ke log |
 
 ### Proteksi basket
 | Parameter | Default | Keterangan |
